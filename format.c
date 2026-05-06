@@ -4143,15 +4143,33 @@ found:
 	return (found);
 }
 
+/* Check if format has not taken too long. */
+static int
+format_check_time(struct format_expand_state *es)
+{
+	uint64_t t = get_timer();
+
+	if (t - es->start_time < FORMAT_TIME_LIMIT)
+		return (1);
+	t -= es->start_time;
+
+	format_log(es, "reached time limit (%llu)", (unsigned long long)t);
+	return (0);
+}
+
 /* Unescape escaped characters. */
 static char *
-format_unescape(const char *s)
+format_unescape(struct format_expand_state *es, const char *s)
 {
 	char	*out, *cp;
 	int	 brackets = 0;
 
 	cp = out = xmalloc(strlen(s) + 1);
 	for (; *s != '\0'; s++) {
+		if (!format_check_time(es)){
+			free(out);
+			return (xstrdup(""));
+		}
 		if (*s == '#' && s[1] == '{')
 			brackets++;
 		if (brackets == 0 &&
@@ -4170,13 +4188,17 @@ format_unescape(const char *s)
 
 /* Remove escaped characters. */
 static char *
-format_strip(const char *s)
+format_strip(struct format_expand_state *es, const char *s)
 {
 	char	*out, *cp;
 	int	 brackets = 0;
 
 	cp = out = xmalloc(strlen(s) + 1);
 	for (; *s != '\0'; s++) {
+		if (!format_check_time(es)){
+			free(out);
+			return (xstrdup(""));
+		}
 		if (*s == '#' && s[1] == '{')
 			brackets++;
 		if (*s == '#' && strchr(",#{}:", s[1]) != NULL) {
@@ -4192,13 +4214,16 @@ format_strip(const char *s)
 	return (out);
 }
 
+
 /* Skip until end. */
-const char *
-format_skip(const char *s, const char *end)
+static const char *
+format_skip1(struct format_expand_state *es, const char *s, const char *end)
 {
 	int	brackets = 0;
 
 	for (; *s != '\0'; s++) {
+		if (es != NULL && !format_check_time(es))
+			return (NULL);
 		if (*s == '#' && s[1] == '{')
 			brackets++;
 		if (*s == '#' &&
@@ -4217,6 +4242,13 @@ format_skip(const char *s, const char *end)
 	return (s);
 }
 
+/* Skip until end. */
+const char *
+format_skip(const char *s, const char *end)
+{
+    return (format_skip1(NULL, s, end));
+}
+
 /* Return left and right alternatives separated by commas. */
 static int
 format_choose(struct format_expand_state *es, const char *s, char **left,
@@ -4225,7 +4257,7 @@ format_choose(struct format_expand_state *es, const char *s, char **left,
 	const char	*cp;
 	char		*left0, *right0;
 
-	cp = format_skip(s, ",");
+	cp = format_skip1(es, s, ",");
 	if (cp == NULL)
 		return (-1);
 	left0 = xstrndup(s, cp - s);
@@ -4240,20 +4272,6 @@ format_choose(struct format_expand_state *es, const char *s, char **left,
 		*left = left0;
 		*right = right0;
 	}
-	return (0);
-}
-
-/* Check format has not taken too lon. */
-static int
-format_check_time(struct format_expand_state *es)
-{
-	uint64_t t = get_timer();
-
-	if (t - es->start_time < FORMAT_TIME_LIMIT)
-		return (1);
-	t -= es->start_time;
-
-	format_log(es, "reached time limit (%llu)", (unsigned long long)t);
 	return (0);
 }
 
@@ -4370,7 +4388,7 @@ format_build_modifiers(struct format_expand_state *es, const char **s,
 
 		/* Single argument with no wrapper character. */
 		if (!ispunct((u_char)cp[1]) || cp[1] == '-') {
-			end = format_skip(cp + 1, ":;");
+			end = format_skip1(es, cp + 1, ":;");
 			if (end == NULL)
 				break;
 
@@ -4393,7 +4411,7 @@ format_build_modifiers(struct format_expand_state *es, const char **s,
 				cp++;
 				break;
 			}
-			end = format_skip(cp + 1, last);
+			end = format_skip1(es, cp + 1, last);
 			if (end == NULL)
 				break;
 			cp++;
@@ -4507,7 +4525,7 @@ format_bool_op_n(struct format_expand_state *es, const char *fmt, int and)
 	cp1 = fmt;
 
 	while (and ? result : !result) {
-		cp2 = format_skip(cp1, ",");
+		cp2 = format_skip1(es, cp1, ",");
 
 		if (cp2 == NULL)
 			raw = xstrdup(cp1);
@@ -5087,7 +5105,7 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 				else if (fm->argc >= 2 &&
 				    strchr(fm->argv[0], 'f') != NULL) {
 					free(time_format);
-					time_format = format_strip(fm->argv[1]);
+					time_format = format_strip(es, fm->argv[1]);
 				}
 				break;
 			case 'q':
@@ -5203,7 +5221,7 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 	/* Is this a literal string? */
 	if (modifiers & FORMAT_LITERAL) {
 		format_log(es, "literal string is '%s'", copy);
-		value = format_unescape(copy);
+		value = format_unescape(es, copy);
 		goto done;
 	}
 
@@ -5356,7 +5374,7 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 		 */
 		cp = copy + 1;
 		while (1) {
-			cp2 = format_skip(cp, ",");
+			cp2 = format_skip1(es, cp, ",");
 			if (cp2 == NULL) {
 				format_log(es,
 				    "no condition matched in '%s'; using last "
@@ -5391,7 +5409,7 @@ format_replace(struct format_expand_state *es, const char *key, size_t keylen,
 			}
 
 			cp = cp2 + 1;
-			cp2 = format_skip(cp, ",");
+			cp2 = format_skip1(es, cp, ",");
 			if (format_true(found)) {
 				format_log(es, "condition '%s' is true",
 				    condition);
@@ -5641,7 +5659,7 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 			fmt += n + 1;
 			continue;
 		case '{':
-			ptr = format_skip((char *)fmt - 2, "}");
+			ptr = format_skip1(es, (char *)fmt - 2, "}");
 			if (ptr == NULL)
 				break;
 			n = ptr - fmt;
@@ -5664,7 +5682,7 @@ format_expand1(struct format_expand_state *es, const char *fmt)
 				n++;
 			}
 			if (*ptr == '[') {
-				style_end = format_skip(fmt - 2, "]");
+				style_end = format_skip1(es, fmt - 2, "]");
 				format_log(es, "found #*%zu[", n);
 				while (len - off < n + 2) {
 					buf = xreallocarray(buf, 2, len);
